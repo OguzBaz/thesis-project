@@ -1,0 +1,14 @@
+{
+  "name": "thesis-project",
+  "version": "1.0.0",
+  "description": "A thesis project that includes various experiments, data analysis, and documentation.",
+  "main": "src/main/index.js",
+  "scripts": {
+    "start": "node src/main/index.js",
+    "test": "echo \"No tests specified\" && exit 0"
+  },
+  "dependencies": {},
+  "devDependencies": {},
+  "author": "",
+  "license": "ISC"
+}

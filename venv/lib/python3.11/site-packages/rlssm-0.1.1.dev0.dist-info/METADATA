@@ -1,0 +1,54 @@
+Metadata-Version: 2.1
+Name: rlssm
+Version: 0.1.1.dev0
+Summary: rlssm: a package for fitting RL models, SSM, and combinations of the two
+Home-page: https://github.com/laurafontanesi/rlssm
+Author: Laura Fontanesi
+Author-email: laura.fontanesi.1@gmail.com
+Maintainer: Laura Fontanesi
+Maintainer-email: laura.fontanesi.1@gmail.com
+License: MIT
+Platform: OS Independent
+Classifier: Development Status :: 1 - Planning
+Classifier: Environment :: Console
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Programming Language :: Python
+Classifier: Topic :: Scientific/Engineering
+Requires: numpy
+Requires: pandas
+Requires: pystan
+Requires-Dist: numpy
+Requires-Dist: pandas
+Requires-Dist: pystan
+
+
+
+rlssm
+========
+``rlssm`` is a Python package for fitting reinforcement learning (RL) models,
+sequential sampling models (DDM, RDM, LBA, ALBA, and ARDM),
+and combinations of the two, using Bayesian parameter estimation.
+
+Parameter estimation is done at an individual or hierarchical level
+using ``PyStan``, the Python Interface to Stan.
+Stan performs Bayesian inference using the No-U-Turn sampler,
+a variant of Hamiltonian Monte Carlo.
+
+Documentation
+=============
+The latest documentation can be found here: https://rlssm.readthedocs.io/
+
+License
+=======
+``rlssm`` is licensed under the terms of the MIT license. See the file
+"LICENSE" for information on the history of this software, terms & conditions
+for usage, and a DISCLAIMER OF ALL WARRANTIES.
+
+All trademarks referenced herein are property of their respective holders.
+
+Copyright (c) 2021--, Laura Fontanesi,
+University of Basel.
+
+

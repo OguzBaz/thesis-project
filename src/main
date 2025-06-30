@@ -1,0 +1,9 @@
+import pandas as pd
+
+input_path = "external/two_step_rep/analysis_code_and_data/data/online/online_mat_files/online_data_for_matlab.txt"
+output_path = "data/online_data_for_matlab.csv"
+
+df = pd.read_csv(input_path, delim_whitespace=True)
+df.to_csv(output_path, index=False)
+
+print(f"Data saved to {output_path}")
