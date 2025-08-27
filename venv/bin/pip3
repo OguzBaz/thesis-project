@@ -1,4 +1,4 @@
-#!/Users/oguz/Desktop/thesis-project/venv/bin/python3.11
+#!/Users/oguz/Desktop/thesis-project/venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys
