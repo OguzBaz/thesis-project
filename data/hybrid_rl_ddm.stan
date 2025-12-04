@@ -1,128 +1,168 @@
-// Two-step Hybrid RL + Stage-2 DDM (RLDDM)
-// - Stage 1: hybrid MB/MF softmax (+ stickiness)
-// - Stage 2: Wiener DDM with drift v_t = vmod * (Q[s2,1] - Q[s2,2])
-// - Learning: TD with eligibility lambda
-//
-// Notes:
-// * RTs (rt2) must be in seconds.
-// * To condition on the observed boundary, we keep z fixed and flip the drift sign if c2==2.
-
 data {
-  int<lower=1> S;                        // subjects
-  int<lower=1> T_max;                    // max trials across subjects
-  array[S] int<lower=0> T;               // trials used per subject (first T[s] rows)
+  int<lower=1> S;
+  array[S] int<lower=1> T;
+  int<lower=1> T_max;
 
-  // per-subject, per-trial (only first T[s] are used)
-  array[S, T_max] int<lower=1,upper=2> c1;      // stage-1 choice (1/2)
-  array[S, T_max] int<lower=1,upper=2> c2;      // stage-2 choice (1/2) -> boundary
-  array[S, T_max] real r;                        // reward outcome
-  array[S, T_max] int<lower=1,upper=3> s2raw;   // second-stage state code (often 2/3)
-  array[S, T_max] real<lower=0> rt2;            // stage-2 response time (seconds)
+  array[S, T_max] int<lower=1, upper=2> c1;
+  array[S, T_max] int<lower=1, upper=2> c2;
+  array[S, T_max] real r;
+  array[S, T_max] int<lower=2, upper=3> s2raw;
+  array[S, T_max] real<lower=0> rt2;
 
-  array[S] int<lower=1,upper=2> prior_choice;   // S1 choice for first modeled trial
-  real<lower=0,upper=1> t_common;               // common transition prob (e.g., 0.7)
+  array[S] real rt2_min;
+  real<lower=0> ter_eps;
+
+  array[S] int<lower=1, upper=2> prior_choice;
+  real<lower=0, upper=1> t_common;
 }
 
 parameters {
-  // RL parameters
-  vector<lower=1e-6, upper=1-1e-6>[S] alpha;     // learning rate
-  vector<lower=1e-6, upper=1-1e-6>[S] lambda_;   // eligibility trace
-  vector<lower=1e-6>[S] beta_mb;                 // S1 MB weight
-  vector<lower=1e-6>[S] beta_mf;                 // S1 MF weight
-  vector[S] stickiness;                          // S1 perseveration bias
+  vector[S] alpha_raw;
+  vector[S] beta_mf_raw;
+  vector[S] beta_mb_raw;
+  vector[S] w_raw;
+  vector[S] stick_raw;
 
-  // DDM (stage-2) parameters
-  vector<lower=1e-6>[S] vmod;                    // drift scaling
-  vector<lower=1e-6>[S] a;                       // boundary separation
-  vector<lower=1e-6>[S] Ter;                     // non-decision time
-  vector<lower=1e-3, upper=1-1e-3>[S] z;         // starting-point fraction (0..1)
+  vector[S] a_raw;
+  vector[S] Ter_raw;
+  vector[S] vmod_raw;
+  vector[S] z_raw;
+}
+
+transformed parameters {
+  vector<lower=0,upper=1>[S] alpha;
+  vector<lower=0,upper=10>[S] beta_mf;
+  vector<lower=0,upper=10>[S] beta_mb;
+  vector<lower=0,upper=1>[S] w;
+  vector[S] stick;
+
+  vector<lower=0.3, upper=3>[S] a;
+  vector<lower=0.05, upper=1>[S] Ter;
+  vector<lower=0.1, upper=5>[S] vmod;
+  vector<lower=0.2, upper=0.8>[S] z;
+
+  for (s in 1:S) {
+    alpha[s]    = inv_logit(alpha_raw[s]);
+    beta_mf[s]  = 10 * inv_logit(beta_mf_raw[s]);
+    beta_mb[s]  = 10 * inv_logit(beta_mb_raw[s]);
+    w[s]        = inv_logit(w_raw[s]);
+    stick[s]    = stick_raw[s] * 0.5;
+
+    a[s] = 0.3 + 2.7 * inv_logit(a_raw[s]);
+    vmod[s] = 0.1 + 4.9 * inv_logit(vmod_raw[s]);
+
+    real upperTer = rt2_min[s] - ter_eps;
+    if (upperTer < 0.06)
+      upperTer = 0.06;
+
+    Ter[s] = 0.05 + (upperTer - 0.05) * inv_logit(Ter_raw[s]);
+
+    z[s] = 0.2 + 0.6 * inv_logit(z_raw[s]);
+  }
 }
 
 model {
-  // --- Priors (tune as needed) ---
-  alpha      ~ beta(1.1, 1.1);
-  lambda_    ~ beta(1.1, 1.1);
-  beta_mb    ~ gamma(3, 1);
-  beta_mf    ~ gamma(3, 1);
-  stickiness ~ normal(0, 10);
 
-  vmod ~ gamma(3, 1);         // positive scale on value difference
-  a    ~ lognormal(0, 0.5);   // > 0
-  Ter  ~ lognormal(-1, 0.5);  // > 0  (seconds)
-  z    ~ beta(1.5, 1.5);      // centered near 0.5
+  alpha_raw ~ normal(0, 1);
+  beta_mf_raw ~ normal(0, 1);
+  beta_mb_raw ~ normal(0, 1);
+  w_raw ~ normal(0, 1);
+  stick_raw ~ normal(0, 1);
 
-  // --- Likelihood ---
+  a_raw ~ normal(0, 1);
+  Ter_raw ~ normal(0, 1);
+  vmod_raw ~ normal(0, 1);
+  z_raw ~ normal(0, 1);
+
   for (s in 1:S) {
-    // Q table: row 1 = S1; rows 2..3 = second-stage states; each has 2 actions
-    matrix[3,2] Q = rep_matrix(0, 3, 2);
-    int prev = prior_choice[s];
+
+    vector[2] Qs;
+    Qs[1] = 0;
+    Qs[2] = 0;
 
     for (t in 1:T[s]) {
-      // map second-stage state: if dataset uses {1,2}, treat 1->2 and 2->3
-      int s2 = (s2raw[s,t] >= 2) ? s2raw[s,t] : 2;  // {2,3} else map 1→2
 
-      // ----- Stage 1 softmax (hybrid MB/MF + stickiness) -----
-      // MB expected-max backup
-      real maxA = fmax(Q[2,1], Q[2,2]);
-      real maxB = fmax(Q[3,1], Q[3,2]);
-      real Qmb1 = t_common      * maxA + (1 - t_common) * maxB; // action 1 at S1
-      real Qmb2 = (1 - t_common)* maxA + t_common       * maxB; // action 2 at S1
-      // MF cached S1 values
-      real Qmf1 = Q[1,1];
-      real Qmf2 = Q[1,2];
-      // stickiness (+p if repeat action 1, -p if repeat action 2)
-      real rep_bias = (prev == 1 ? 1 : (prev == 2 ? -1 : 0)) * stickiness[s];
+      int st = s2raw[s,t] - 1;
 
-      // Bernoulli-logit on a1==1
-      real logit_s1 = beta_mf[s] * (Qmf1 - Qmf2)
-                    + beta_mb[s] * (Qmb1 - Qmb2)
-                    + rep_bias;
-      target += bernoulli_logit_lpmf(c1[s,t] == 1 | logit_s1);
+      real Qmf = Qs[st];
+      real Qmb = 0.5 * (Qs[1] + Qs[2]);
+      real Qhyb = w[s] * Qmb + (1 - w[s]) * Qmf;
 
-      // ----- Stage 2 DDM (Wiener) -----
-      // trial-wise drift from value difference (before updating)
-      real delta_Q = Q[s2,1] - Q[s2,2];
-      real v_raw   = vmod[s] * delta_Q;   // this is v_t
+      real util1 = beta_mf[s] * Qhyb + stick[s] * (prior_choice[s] == c1[s,t]);
 
-      // condition on observed boundary by flipping drift only
-      real drift_eff = (c2[s,t] == 1) ?  v_raw : -v_raw;
-      target += wiener_lpdf(rt2[s,t] | a[s], Ter[s], z[s], drift_eff);
+      target += bernoulli_logit_lpmf(c1[s,t] - 1 | util1);
 
-      // ----- TD(λ) updates -----
-      real delta_rew   = r[s,t] - Q[s2, c2[s,t]];
-      Q[s2, c2[s,t]]  += alpha[s] * delta_rew;
+      // SAFE DRIFT
+      real drift = vmod[s] * (beta_mf[s] * Qmf);
+      real drift_safe = drift;
 
-      real delta_state = Q[s2, c2[s,t]] - Q[1, c1[s,t]];
-      Q[1, c1[s,t]]   += alpha[s] * delta_state + lambda_[s] * alpha[s] * delta_rew;
+      if (drift_safe < 0.01) drift_safe = 0.01;
+      if (drift_safe > 5)    drift_safe = 5;
 
-      prev = c1[s,t];
+      target += wiener_lpdf(rt2[s,t] |
+                            a[s],
+                            Ter[s],
+                            z[s],
+                            drift_safe);
+
+      Qs[st] = Qs[st] + alpha[s] * (r[s,t] - Qs[st]);
     }
   }
 }
 
 generated quantities {
-  // Report hybrid stage-1 temp & weight (handy)
-  vector[S] beta1_stage1 = beta_mb + beta_mf;
-  vector[S] w_hybrid;
-  for (s in 1:S) w_hybrid[s] = beta_mb[s] / (beta_mb[s] + beta_mf[s]);
+  array[S, T_max] int y1_rep;
+  array[S, T_max] real y2_rep;
+  array[S, T_max] real log_lik;
 
-  // Optional: per-trial v_t (not produced by `optimize()` runs)
-  array[S, T_max] real v_t;
   for (s in 1:S) {
-    matrix[3,2] Q = rep_matrix(0, 3, 2);
-    int prev = prior_choice[s];
+
+    vector[2] Qs;
+    Qs[1] = 0;
+    Qs[2] = 0;
+
     for (t in 1:T[s]) {
-      int s2 = (s2raw[s,t] >= 2) ? s2raw[s,t] : 2;
 
-      real delta_Q = Q[s2,1] - Q[s2,2];
-      v_t[s,t] = vmod[s] * delta_Q;  // save drift before learning update
+      int st = s2raw[s,t] - 1;
 
-      real delta_rew   = r[s,t] - Q[s2, c2[s,t]];
-      Q[s2, c2[s,t]]  += alpha[s] * delta_rew;
-      real delta_state = Q[s2, c2[s,t]] - Q[1, c1[s,t]];
-      Q[1, c1[s,t]]   += alpha[s] * delta_state + lambda_[s] * alpha[s] * delta_rew;
-      prev = c1[s,t];
+      real Qmf = Qs[st];
+      real Qmb = 0.5 * (Qs[1] + Qs[2]);
+      real Qhyb = w[s] * Qmb + (1 - w[s]) * Qmf;
+
+      real util1 = beta_mf[s] * Qhyb + stick[s] * (prior_choice[s] == c1[s,t]);
+
+      // log likelihood
+      log_lik[s,t] = bernoulli_logit_lpmf(c1[s,t] - 1 | util1);
+
+      // replicate choice
+      y1_rep[s,t] = bernoulli_logit_rng(util1) + 1;
+
+      // safe drift again
+      real drift = vmod[s] * (beta_mf[s] * Qmf);
+      real drift_safe = drift;
+
+      if (drift_safe < 0.01) drift_safe = 0.01;
+      if (drift_safe > 5)    drift_safe = 5;
+
+      // simple RT generator (not wiener_rng)
+      real mean_rt = Ter[s] + (a[s] * z[s]) / drift_safe;
+      real sd_rt   = 0.05 + fabs(0.2 / drift_safe);
+
+      if (mean_rt < 0.05) mean_rt = 0.05;
+
+      y2_rep[s,t] = normal_rng(mean_rt, sd_rt);
+
+      if (y2_rep[s,t] < 0.05)
+        y2_rep[s,t] = 0.05;
+
+      Qs[st] = Qs[st] + alpha[s] * (r[s,t] - Qs[st]);
     }
-    for (t in (T[s]+1):T_max) v_t[s,t] = 0; // fill padding, ignored
+
+    // pad trials if needed
+    for (t in T[s] + 1:T_max) {
+      y1_rep[s,t] = 1;
+      y2_rep[s,t] = 0.1;
+      log_lik[s,t] = 0;
+    }
   }
 }
