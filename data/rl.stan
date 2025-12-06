@@ -1,94 +1,150 @@
-// Stan Hybrid Reinforcement Learning Model (two-step task, MB/MF hybrid)
-// Eqs: (1) TD learning with eligibility lambda
-//      (2) MB expected-max with t_common
-//      (3) Hybrid softmax (S1) + softmax (S2)
-// Priors: alpha, lambda ~ Beta(1.1,1.1); betas ~ Gamma(3,1); stickiness ~ Normal(0,10)
-
+// Hybrid Reinforcement Learning Model (two-step task)
+// Using single beta (beta1) and a hybrid weight (w_mb)
 data {
   int<lower=1> S;
-  int<lower=1> T_max;
   array[S] int<lower=0> T;
-  array[S, T_max] int<lower=1,upper=2> c1;
-  array[S, T_max] int<lower=1,upper=2> c2;
+  int<lower=1> T_max;
+
+  // FIX: Change <lower=1> to <lower=0> or remove the constraint entirely
+  array[S, T_max] int<lower=0,upper=2> c1; // Allow 0 for padding
+  array[S, T_max] int<lower=0,upper=2> c2; // Allow 0 for padding
+  
   array[S, T_max] real r;
-  array[S, T_max] int<lower=1,upper=3> s2raw;
+  array[S, T_max] int<lower=0,upper=3> s2raw; 
   array[S] int<lower=1,upper=2> prior_choice;
   real<lower=0,upper=1> t_common;
 }
 
 parameters {
-  // subject-level parameters (independent priors, as in MATLAB fits)
-  vector<lower=1e-6, upper=1-1e-6>[S] alpha;     // learning rate
-  vector<lower=1e-6, upper=1-1e-6>[S] lambda_;   // eligibility trace
-  vector<lower=1e-6>[S] beta_mb;                 // S1 MB inverse-temp weight
-  vector<lower=1e-6>[S] beta_mf;                 // S1 MF inverse-temp weight
-  vector<lower=1e-6>[S] beta2;                   // S2 inverse temperature
-  vector[S] stickiness;                          // perseveration bias (real)
+  // RL Parameters
+  vector<lower=1e-6, upper=1-1e-6>[S] alpha;      // Learning rate
+  vector<lower=1e-6, upper=1-1e-6>[S] lambda_;    // Eligibility trace
+  
+  // Inverse Temperatures and Weight
+  vector<lower=1e-6>[S] beta1;                    // Total Stage 1 Beta (Beta_MF + Beta_MB)
+  vector<lower=1e-6>[S] beta2;                    // Stage 2 Beta
+  vector<lower=1e-6, upper=1-1e-6>[S] w_mb;       // MB Weight (w)
+  
+  // Stickiness
+  vector[S] stickiness;
 }
 
 model {
-  // ----- Priors (MAP-style) -----
-  alpha      ~ beta(1.1, 1.1);
-  lambda_    ~ beta(1.1, 1.1);
-  beta_mb    ~ gamma(3, 1);
-  beta_mf    ~ gamma(3, 1);
-  beta2      ~ gamma(3, 1);
+  // Priors
+  alpha    ~ beta(1.1, 1.1);
+  lambda_  ~ beta(1.1, 1.1);
+  w_mb     ~ beta(1.1, 1.1);
+  beta1    ~ gamma(3, 1);
+  beta2    ~ gamma(3, 1);
   stickiness ~ normal(0, 10);
 
-  // ----- Likelihood -----
   for (s in 1:S) {
-    // Q table: row 1 = S1; rows 2 & 3 = second-stage states; each has 2 actions
     matrix[3,2] Q = rep_matrix(0, 3, 2);
-    int prev = prior_choice[s]; // for S1 stickiness on first modeled trial
+    int prev = prior_choice[s];
 
     for (t in 1:T[s]) {
-      // Map to rows 2 or 3 (accept 2/3; if data uses 1/2, still works)
-      int s2;
-      if (s2raw[s,t] == 3) s2 = 3;
-      else if (s2raw[s,t] == 2) s2 = 2;
-      else s2 = s2raw[s,t];
+      int s2 = (s2raw[s,t] >= 2) ? s2raw[s,t] : 2;
 
-      // (2) Model-based expected-max backup at stage-1:
-      real maxA = fmax(Q[2,1], Q[2,2]); // best action if landing in state A (row 2)
-      real maxB = fmax(Q[3,1], Q[3,2]); // best action if landing in state B (row 3)
-      real Qmb1 = t_common      * maxA + (1 - t_common) * maxB; // pick S1 action 1
-      real Qmb2 = (1 - t_common)* maxA + t_common       * maxB; // pick S1 action 2
+      // MB Q-Values
+      real maxA = fmax(Q[2,1], Q[2,2]);
+      real maxB = fmax(Q[3,1], Q[3,2]);
+      real Qmb1 = t_common    * maxA + (1 - t_common) * maxB;
+      real Qmb2 = (1 - t_common)* maxA + t_common    * maxB;
 
-      // MF cached S1 values
+      // MF Q-Values
       real Qmf1 = Q[1,1];
       real Qmf2 = Q[1,2];
 
-      // Stickiness bias: +p for repeating action 1, -p if previous was 2
+      // Choice Bias (Stickiness)
       real rep_bias = (prev == 1 ? 1 : (prev == 2 ? -1 : 0)) * stickiness[s];
 
-      // (3) Stage-1 hybrid softmax: Bernoulli-logit on (a1==1) with hybrid value diff
-      real logit_s1 = beta_mf[s] * (Qmf1 - Qmf2)
-                    + beta_mb[s] * (Qmb1 - Qmb2)
-                    + rep_bias;
-      target += bernoulli_logit_lpmf( c1[s,t] == 1 | logit_s1 );
+      // Stage 1 Logit (Hybrid Decision Rule)
+      real delta_mf = Qmf1 - Qmf2;
+      real delta_mb = Qmb1 - Qmb2;
+      
+      real logit_s1 = beta1[s] * ((1 - w_mb[s]) * delta_mf + w_mb[s] * delta_mb)
+                        + rep_bias;
 
-      // Stage-2 softmax: Bernoulli-logit on (a2==1) with beta2 * Q-diff
+      target += bernoulli_logit_lpmf(c1[s,t] == 1 | logit_s1);
+
+      // Stage 2 Logit
       real logit_s2 = beta2[s] * (Q[s2,1] - Q[s2,2]);
-      target += bernoulli_logit_lpmf( c2[s,t] == 1 | logit_s2 );
+      target += bernoulli_logit_lpmf(c2[s,t] == 1 | logit_s2);
 
-      // (1) TD learning with eligibility:
-      // reward PE at stage-2
+      // Q-Value Updates (Model-Free)
+      // 1. Final outcome to State 2 Q-values
       real delta_rew = r[s,t] - Q[s2, c2[s,t]];
       Q[s2, c2[s,t]] += alpha[s] * delta_rew;
 
-      // state-PE at stage-1 plus lambda back-prop of reward PE
+      // 2. State 2 Q-values to State 1 Q-values (plus eligibility trace)
       real delta_state = Q[s2, c2[s,t]] - Q[1, c1[s,t]];
-      Q[1, c1[s,t]] += alpha[s] * delta_state + lambda_[s] * alpha[s] * delta_rew;
+      Q[1, c1[s,t]] += alpha[s] * delta_state
+                         + lambda_[s] * alpha[s] * delta_rew; // SARSA(lambda) term
 
-      // update prev choice for next trial's stickiness
       prev = c1[s,t];
     }
   }
 }
 
 generated quantities {
-  // handy reparameterizations for reporting
-  vector[S] beta1_stage1 = beta_mb + beta_mf;       // overall S1 inverse temperature
-  vector[S] w_hybrid;
-  for (s in 1:S) w_hybrid[s] = beta_mb[s] / (beta_mb[s] + beta_mf[s]);
+  array[S, T_max] real log_lik;
+  array[S, T_max] int y1_rep;
+  array[S, T_max] int y2_rep;
+
+  for (s in 1:S) {
+    matrix[3,2] Q = rep_matrix(0, 3, 2);
+    int prev = prior_choice[s];
+
+    for (t in 1:T[s]) {
+      int s2 = (s2raw[s,t] >= 2) ? s2raw[s,t] : 2;
+
+      // MB Q-Values
+      real maxA = fmax(Q[2,1], Q[2,2]);
+      real maxB = fmax(Q[3,1], Q[3,2]);
+      real Qmb1 = t_common    * maxA + (1 - t_common) * maxB;
+      real Qmb2 = (1 - t_common)* maxA + t_common    * maxB;
+
+      // MF Q-Values
+      real Qmf1 = Q[1,1];
+      real Qmf2 = Q[1,2];
+
+      // Choice Bias
+      real rep_bias = (prev == 1 ? 1 : (prev == 2 ? -1 : 0)) * stickiness[s];
+
+      // Stage 1 Logit (Hybrid Decision Rule)
+      real delta_mf = Qmf1 - Qmf2;
+      real delta_mb = Qmb1 - Qmb2;
+      
+      real logit_s1 = beta1[s] * ((1 - w_mb[s]) * delta_mf + w_mb[s] * delta_mb)
+                        + rep_bias;
+
+      // Stage 2 Logit
+      real logit_s2 = beta2[s] * (Q[s2,1] - Q[s2,2]);
+
+      // Predictive Choices
+      y1_rep[s,t] = bernoulli_logit_rng(logit_s1) ? 1 : 2;
+      y2_rep[s,t] = bernoulli_logit_rng(logit_s2) ? 1 : 2;
+
+      // Log-Likelihood
+      log_lik[s,t] = bernoulli_logit_lpmf(c1[s,t] == 1 | logit_s1)
+                   + bernoulli_logit_lpmf(c2[s,t] == 1 | logit_s2);
+
+      // Q-Value Updates (same as model block)
+      real delta_rew = r[s,t] - Q[s2, c2[s,t]];
+      Q[s2, c2[s,t]] += alpha[s] * delta_rew;
+
+      real delta_state = Q[s2, c2[s,t]] - Q[1, c1[s,t]];
+      Q[1, c1[s,t]] += alpha[s] * delta_state
+                         + lambda_[s] * alpha[s] * delta_rew;
+
+      prev = c1[s,t];
+    }
+    
+    // Fill remaining T_max slots with dummy data/zero log-lik
+    for (t in (T[s]+1):T_max) {
+      log_lik[s,t] = 0;
+      y1_rep[s,t] = 1;
+      y2_rep[s,t] = 1;
+    }
+  }
 }
