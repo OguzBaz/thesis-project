@@ -80,7 +80,6 @@ model {
       real delta_state = Q[s2, c2[s,t]] - Q[1, c1[s,t]];
       Q[1, c1[s,t]] += alpha[s] * delta_state
                          + lambda_[s] * alpha[s] * delta_rew; // SARSA(lambda) term
-
       prev = c1[s,t];
     }
   }
